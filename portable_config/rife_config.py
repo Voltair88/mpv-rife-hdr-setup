@@ -109,5 +109,7 @@ tensorrt_max_shape = [
 # Logging Settings
 # =============================================================================
 
-# Log file path. Set to None for no log, or to an output stream to a log file
-log = open(r"C:\Users\volta\AppData\Local\Temp\rife_log.txt", "w")
+# Log file. None = no logging (default). To enable, open a writable file stream, e.g.:
+#   import os, tempfile
+#   log = open(os.path.join(tempfile.gettempdir(), "rife_log.txt"), "w")
+log = None

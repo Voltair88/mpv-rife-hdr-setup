@@ -28,6 +28,8 @@ real‑time RIFE frame interpolation via TensorRT, a careful HDR pipeline, and a
   — modified so seekbar thumbnails generate **only while paused**, avoiding GPU contention with RIFE
   during playback (which otherwise produced black/stale thumbnails).
 - **HDR tone‑mapping** config in `mpv.conf` (gpu‑next, `target-peak=1000`, etc.).
+- **Finer audio sync** — `Ctrl +` / `Ctrl -` (main row & numpad) nudge `audio-delay` in **50 ms**
+  steps (mpv's default is 100 ms). (`input.conf`)
 - **Autocrop** to fill the display with **`Shift+C`** (from mpv-enhanced).
 
 ## Setup
