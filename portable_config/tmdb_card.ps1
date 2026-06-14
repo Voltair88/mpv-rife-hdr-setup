@@ -1,9 +1,12 @@
 #requires -version 5
-# tmdb_card.ps1 -- render the whole movie-info card (backdrop + dark panel + poster + text)
+# tmdb_card.ps1 -- render the whole movie/TV info card (backdrop + dark panel + poster + text)
 # into ONE BGRA buffer for a single mpv overlay-add. Avoids the ASS-vs-bitmap z-order conflict.
 #
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File tmdb_card.ps1 -Spec <json-file>
 # Prints "<cardW> <cardH>" on success; "ERR <message>" + exit 1 on failure.
+#
+# The layout is computed at a natural size then UNIFORMLY scaled to fit within max_w x max_h
+# (the window minus margins) so the card is never clipped in a small / non-fullscreen window.
 param([Parameter(Mandatory = $true)][string]$Spec)
 
 $ErrorActionPreference = 'Stop'
@@ -81,15 +84,12 @@ try {
 
     $H = [int]$s.height
     $Wd = [int]$s.width_hint
-    function Scale([double]$f) { return [int][Math]::Round($H * $f) }
-    $pad = Scale 0.020; $gap = Scale 0.020; $radius = Scale 0.012
-    $title_fs = Scale 0.030; $meta_fs = Scale 0.0195; $body_fs = Scale 0.016
-    $tagline_fs = [int][Math]::Round($meta_fs * 0.92); $credit_fs = [int][Math]::Round($body_fs * 0.92)
-    $sp1 = Scale 0.012; $sp2 = Scale 0.016; $sp_small = Scale 0.008
-    $pw = [int]$s.poster_width
-    $text_w = [Math]::Max(440, [Math]::Min(900, [int]($Wd * 0.26)))
+    # Available room for the card (window minus margins). Falls back to full size for old specs.
+    $maxW = if ($s.max_w) { [int]$s.max_w } else { $Wd }
+    $maxH = if ($s.max_h) { [int]$s.max_h } else { $H }
+    $pwReq = [int]$s.poster_width
+    $baseTextW = [Math]::Max(440, [Math]::Min(900, [int]($Wd * 0.26)))
 
-    # Color is handled by an optional BT.2020-PQ post-encode (HDR), not per-image knobs.
     $hdrEncode = [bool]$s.hdr_encode
     $refNits = if ($s.ref_nits) { [double]$s.ref_nits } else { 203.0 }
     $iaBd = New-ColorAttrs 1.0 0.42 1.0   # backdrop only dimmed for legibility (no color change)
@@ -97,54 +97,110 @@ try {
     $poster = Get-Img $s.poster_url
     $backdrop = $null
     if ($s.show_backdrop) { $backdrop = Get-Img $s.backdrop_url }
+    $posterAspect = if ($poster) { $poster.Height / $poster.Width } else { 0 }
 
-    if ($poster) { $ph = [int]($poster.Height * $pw / $poster.Width) } else { $pw = 0; $ph = 0 }
-    $colGap = if ($pw -gt 0) { $gap } else { 0 }
-
-    # fonts (sizes in pixels)
     $PX = [System.Drawing.GraphicsUnit]::Pixel
-    $fTitle  = New-Object System.Drawing.Font('Segoe UI', $title_fs, [System.Drawing.FontStyle]::Bold, $PX)
-    $fTag    = New-Object System.Drawing.Font('Segoe UI', $tagline_fs, [System.Drawing.FontStyle]::Italic, $PX)
-    $fMeta   = New-Object System.Drawing.Font('Segoe UI', $meta_fs, [System.Drawing.FontStyle]::Regular, $PX)
-    $fMetaB  = New-Object System.Drawing.Font('Segoe UI', $meta_fs, [System.Drawing.FontStyle]::Bold, $PX)
-    $fBody   = New-Object System.Drawing.Font('Segoe UI', $body_fs, [System.Drawing.FontStyle]::Regular, $PX)
-    $fCredit = New-Object System.Drawing.Font('Segoe UI', $credit_fs, [System.Drawing.FontStyle]::Regular, $PX)
+    $fmt = New-Object System.Drawing.StringFormat
+    $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
+    $fmt.FormatFlags = [System.Drawing.StringFormatFlags]::LineLimit
 
     $tmp = New-Object System.Drawing.Bitmap(1, 1)
     $mg = [System.Drawing.Graphics]::FromImage($tmp)
     $mg.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
     function LineH($font) { return [int][Math]::Ceiling($mg.MeasureString('Ag', $font).Height) }
 
-    # content
+    # content strings (independent of scale)
     $title = [string]$s.title
     if ($s.year) { $title = "$title ($($s.year))" }
     $tagline = [string]$s.tagline
-
-    $fmt = New-Object System.Drawing.StringFormat
-    $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
-    $fmt.FormatFlags = [System.Drawing.StringFormatFlags]::LineLimit
-    $plotMaxH = 5 * (LineH $fBody)
-    $plotH = 0
-    if ($s.overview) {
-        $sz = $mg.MeasureString([string]$s.overview, $fBody, (New-Object System.Drawing.SizeF($text_w, $plotMaxH)), $fmt)
-        $plotH = [int][Math]::Ceiling($sz.Height)
-    }
-
     $creditParts = @()
     if ($s.director) { $creditParts += "Dir  $($s.director)" }
     if ($s.cast) { $creditParts += "Cast  $($s.cast)" }
     $credit = if ($creditParts.Count -gt 0) { $creditParts -join ("    " + [char]0x2022 + "    ") } else { $null }
 
-    $hTitle = LineH $fTitle
-    $hTag = if ($tagline) { $sp_small + (LineH $fTag) } else { 0 }
-    $hMeta = LineH $fMeta
-    $hPlot = if ($plotH -gt 0) { $sp2 + $plotH } else { 0 }
-    $hCredit = if ($credit) { $sp2 + (LineH $fCredit) } else { 0 }
-    $text_h = $hTitle + $hTag + $sp1 + $hMeta + $hPlot + $hCredit
+    # Compute the full layout for a given uniform scale (1.0 = natural). Returns a hashtable.
+    function Compute-Layout([double]$scale) {
+        $Hu = $H * $scale
+        $pad = [int][Math]::Round($Hu * 0.020)
+        $gap = [int][Math]::Round($Hu * 0.020)
+        $radius = [int][Math]::Round($Hu * 0.012)
+        $sp1 = [int][Math]::Round($Hu * 0.012)
+        $sp2 = [int][Math]::Round($Hu * 0.016)
+        $sp_small = [int][Math]::Round($Hu * 0.008)
+        $title_fs = [Math]::Max(6, [int][Math]::Round($Hu * 0.030))
+        $meta_fs = [Math]::Max(5, [int][Math]::Round($Hu * 0.0195))
+        $body_fs = [Math]::Max(4, [int][Math]::Round($Hu * 0.016))
+        $tagline_fs = [Math]::Max(4, [int][Math]::Round($meta_fs * 0.92))
+        $credit_fs = [Math]::Max(4, [int][Math]::Round($body_fs * 0.92))
+        $plotPrefW = [int][Math]::Round($baseTextW * $scale)   # preferred plot wrap width
 
-    $content_h = [Math]::Max($ph, $text_h)
-    $cardW = $pad + $pw + $colGap + $text_w + $pad
-    $cardH = $pad + $content_h + $pad
+        $fTitle = New-Object System.Drawing.Font('Segoe UI', $title_fs, [System.Drawing.FontStyle]::Bold, $PX)
+        $fTag = New-Object System.Drawing.Font('Segoe UI', $tagline_fs, [System.Drawing.FontStyle]::Italic, $PX)
+        $fMeta = New-Object System.Drawing.Font('Segoe UI', $meta_fs, [System.Drawing.FontStyle]::Regular, $PX)
+        $fMetaB = New-Object System.Drawing.Font('Segoe UI', $meta_fs, [System.Drawing.FontStyle]::Bold, $PX)
+        $fBody = New-Object System.Drawing.Font('Segoe UI', $body_fs, [System.Drawing.FontStyle]::Regular, $PX)
+        $fCredit = New-Object System.Drawing.Font('Segoe UI', $credit_fs, [System.Drawing.FontStyle]::Regular, $PX)
+
+        # The title and meta rows are single (un-wrapped) lines, so the text column must be wide
+        # enough for the WIDEST of them or they overflow the card's right edge. Measure exactly as
+        # drawn (mixed fonts), then size text_w to fit; the plot wraps within that width.
+        $metaW = 0.0
+        if ($s.rating) {
+            $rt = ([char]0x2605) + ' ' + ('{0:0.0}' -f [double]$s.rating)
+            $metaW += $mg.MeasureString($rt, $fMetaB).Width
+            if ($s.rating_note) { $metaW += $mg.MeasureString(' ' + [string]$s.rating_note, $fMeta).Width }
+        }
+        $bulletStr = '   ' + [char]0x2022 + '   '
+        $grayParts = @()
+        if ($s.genres) { $grayParts += [string]$s.genres }
+        if ($s.runtime) { $rm = [int]$s.runtime; $grayParts += ('{0}h {1:00}m' -f [int][Math]::Floor($rm / 60), ($rm % 60)) }
+        if ($grayParts.Count -gt 0) {
+            $rest = $grayParts -join $bulletStr
+            if ($s.rating) { $rest = $bulletStr + $rest }
+            $metaW += $mg.MeasureString($rest, $fMeta).Width
+        }
+        $titleW = $mg.MeasureString($title, $fTitle).Width
+        $text_w = [Math]::Max($plotPrefW, [Math]::Max([int][Math]::Ceiling($titleW), [int][Math]::Ceiling($metaW)))
+
+        $pw = if ($poster) { [int][Math]::Round($pwReq * $scale) } else { 0 }
+        $ph = if ($poster) { [int][Math]::Round($pw * $posterAspect) } else { 0 }
+        $colGap = if ($pw -gt 0) { $gap } else { 0 }
+
+        $plotMaxH = 5 * (LineH $fBody)
+        $plotH = 0
+        if ($s.overview) {
+            $sz = $mg.MeasureString([string]$s.overview, $fBody, (New-Object System.Drawing.SizeF($text_w, $plotMaxH)), $fmt)
+            $plotH = [int][Math]::Ceiling($sz.Height)
+        }
+
+        $hTitle = LineH $fTitle
+        $hTag = if ($tagline) { $sp_small + (LineH $fTag) } else { 0 }
+        $hMeta = LineH $fMeta
+        $hPlot = if ($plotH -gt 0) { $sp2 + $plotH } else { 0 }
+        $hCredit = if ($credit) { $sp2 + (LineH $fCredit) } else { 0 }
+        $text_h = $hTitle + $hTag + $sp1 + $hMeta + $hPlot + $hCredit
+
+        $content_h = [Math]::Max($ph, $text_h)
+        $cardW = $pad + $pw + $colGap + $text_w + $pad
+        $cardH = $pad + $content_h + $pad
+
+        return @{
+            pad = $pad; radius = $radius; sp1 = $sp1; sp2 = $sp2; sp_small = $sp_small
+            pw = $pw; ph = $ph; colGap = $colGap; text_w = $text_w
+            fTitle = $fTitle; fTag = $fTag; fMeta = $fMeta; fMetaB = $fMetaB; fBody = $fBody; fCredit = $fCredit
+            hTitle = $hTitle; hTag = $hTag; hMeta = $hMeta; hPlot = $hPlot; hCredit = $hCredit
+            plotH = $plotH; text_h = $text_h; content_h = $content_h; cardW = $cardW; cardH = $cardH
+        }
+    }
+
+    # 1st pass natural, then uniformly shrink to fit the window (with a small safety margin).
+    $L = Compute-Layout 1.0
+    $fit = [Math]::Min(1.0, [Math]::Min($maxW / [double]$L.cardW, $maxH / [double]$L.cardH))
+    if ($fit -lt 1.0) { $L = Compute-Layout ($fit * 0.98) }
+
+    $pad = $L.pad; $radius = $L.radius; $sp1 = $L.sp1; $sp2 = $L.sp2; $sp_small = $L.sp_small
+    $pw = $L.pw; $ph = $L.ph; $colGap = $L.colGap; $text_w = $L.text_w
+    $content_h = $L.content_h; $text_h = $L.text_h; $cardW = $L.cardW; $cardH = $L.cardH
 
     # ---- compose ----
     $card = New-Object System.Drawing.Bitmap($cardW, $cardH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -168,7 +224,7 @@ try {
     $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 0, 0, 0))), 0, 0, $cardW, $cardH)
 
     # poster (rounded, with a faint border)
-    if ($poster) {
+    if ($poster -and $pw -gt 0) {
         $px = $pad
         $py = $pad + [int](($content_h - $ph) / 2)
         $pPath = New-RoundedPath $px $py $pw $ph ([int]($radius * 0.6))
@@ -185,24 +241,29 @@ try {
     $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
     $grayB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 188, 188, 188))
     $plotB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 206, 206, 206))
-    $tagB  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 176, 176, 176))
+    $tagB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 176, 176, 176))
     $goldB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 200, 64))
 
     $y = $ty
-    $g.DrawString($title, $fTitle, $white, [single]$tx, [single]$y)
-    $y += $hTitle
+    $g.DrawString($title, $L.fTitle, $white, [single]$tx, [single]$y)
+    $y += $L.hTitle
     if ($tagline) {
-        $g.DrawString($tagline, $fTag, $tagB, [single]$tx, [single]($y + $sp_small))
-        $y += $hTag
+        $g.DrawString($tagline, $L.fTag, $tagB, [single]$tx, [single]($y + $sp_small))
+        $y += $L.hTag
     }
     $y += $sp1
-    # meta row: gold rating, then gray "• genres • runtime"
+    # meta row: gold rating, optional "(series/episode)" source label, then gray "• genres • runtime"
     $mx = $tx
     $bullet = "   " + [char]0x2022 + "   "
     if ($s.rating) {
         $rt = ([char]0x2605) + " " + ('{0:0.0}' -f [double]$s.rating)
-        $g.DrawString($rt, $fMetaB, $goldB, [single]$mx, [single]$y)
-        $mx += $mg.MeasureString($rt, $fMetaB).Width
+        $g.DrawString($rt, $L.fMetaB, $goldB, [single]$mx, [single]$y)
+        $mx += $mg.MeasureString($rt, $L.fMetaB).Width
+        if ($s.rating_note) {
+            $note = " " + [string]$s.rating_note
+            $g.DrawString($note, $L.fMeta, $grayB, [single]$mx, [single]$y)
+            $mx += $mg.MeasureString($note, $L.fMeta).Width
+        }
     }
     $grayParts = @()
     if ($s.genres) { $grayParts += [string]$s.genres }
@@ -210,16 +271,16 @@ try {
     if ($grayParts.Count -gt 0) {
         $rest = $grayParts -join $bullet
         if ($s.rating) { $rest = $bullet + $rest }
-        $g.DrawString($rest, $fMeta, $grayB, [single]$mx, [single]$y)
+        $g.DrawString($rest, $L.fMeta, $grayB, [single]$mx, [single]$y)
     }
-    $y += $hMeta
-    if ($plotH -gt 0) {
-        $rectF = New-Object System.Drawing.RectangleF([single]$tx, [single]($y + $sp2), [single]$text_w, [single]$plotH)
-        $g.DrawString([string]$s.overview, $fBody, $plotB, $rectF, $fmt)
-        $y += $hPlot
+    $y += $L.hMeta
+    if ($L.plotH -gt 0) {
+        $rectF = New-Object System.Drawing.RectangleF([single]$tx, [single]($y + $sp2), [single]$text_w, [single]$L.plotH)
+        $g.DrawString([string]$s.overview, $L.fBody, $plotB, $rectF, $fmt)
+        $y += $L.hPlot
     }
     if ($credit) {
-        $g.DrawString($credit, $fCredit, $grayB, [single]$tx, [single]($y + $sp2))
+        $g.DrawString($credit, $L.fCredit, $grayB, [single]$tx, [single]($y + $sp2))
     }
 
     $g.Dispose()

@@ -38,6 +38,14 @@ local GENRES = {
     [53] = 'Thriller', [10752] = 'War', [37] = 'Western',
 }
 
+-- TMDb TV genre ids differ from movie ids (separate taxonomy)
+local TV_GENRES = {
+    [10759] = 'Action & Adventure', [16] = 'Animation', [35] = 'Comedy', [80] = 'Crime',
+    [99] = 'Documentary', [18] = 'Drama', [10751] = 'Family', [10762] = 'Kids',
+    [9648] = 'Mystery', [10763] = 'News', [10764] = 'Reality', [10765] = 'Sci-Fi & Fantasy',
+    [10766] = 'Soap', [10767] = 'Talk', [10768] = 'War & Politics', [37] = 'Western',
+}
+
 local cache_dir = mp.command_native({ 'expand-path', '~~/tmdb-cache' })
 local card_helper = mp.command_native({ 'expand-path', '~~/tmdb_card.ps1' })
 
@@ -88,7 +96,9 @@ end
 
 local function trim(s) return (s:gsub('^%s+', ''):gsub('%s+$', '')) end
 
--- Parse "Some.Movie.Name.2026.2160p.WEB-DL..." -> title, year
+-- Parse a filename into a lookup spec:
+--   movie: "Some.Movie.2026.2160p..."  -> { kind='movie', title=..., year=... }
+--   tv:    "Show.Name.S04E08.Title..." -> { kind='tv', title=..., season=N, episode=N }
 local function parse_filename()
     local path = mp.get_property('path', '')
     if path == '' or path:match('^%a[%w%+%-%.]*://') then return nil end -- skip streams/URLs
@@ -96,6 +106,17 @@ local function parse_filename()
     if name == '' then return nil end
 
     local s = name:gsub('[._]+', ' '):gsub('%s+', ' ')
+
+    -- TV episode marker SxxExx (also S4E8). Title is everything before it.
+    local ep_pos, _, sn, en = s:find('[Ss](%d%d?)[Ee](%d%d?)')
+    if ep_pos then
+        local tvtitle = trim(s:sub(1, ep_pos - 1))
+        tvtitle = trim((tvtitle:gsub('%s+%d%d%d%d$', ''))) -- drop a trailing year from the show name
+        if tvtitle ~= '' then
+            return { kind = 'tv', title = tvtitle, season = tonumber(sn), episode = tonumber(en) }
+        end
+    end
+
     local title, year
 
     -- first 4-digit token in 1900..2099 marks the year; title is everything before it
@@ -123,11 +144,15 @@ local function parse_filename()
 
     title = trim(title)
     if title == '' then return nil end
-    return title, year
+    return { kind = 'movie', title = title, year = year }
 end
 
-local function cache_key(title, year)
-    return (title .. '_' .. (year or '')):lower():gsub('[^%w]+', '_'):gsub('^_+', ''):gsub('_+$', '')
+local function cache_key(info)
+    local base = info.title .. '_' .. (info.year or '')
+    if info.kind == 'tv' then
+        base = base .. string.format('_s%02de%02d', info.season or 0, info.episode or 0)
+    end
+    return base:lower():gsub('[^%w]+', '_'):gsub('^_+', ''):gsub('_+$', '')
 end
 
 ------------------------------------------------------------------- rendering
@@ -211,12 +236,14 @@ compose_card = function(meta, my_req, W, H, out)
     local function img(base, path) return path and (base .. path) or '' end
     local spec = {
         out = out, height = H, width_hint = W, poster_width = math.floor(opts.poster_width),
+        -- room the card may occupy (window minus margins) so it scales to fit when not fullscreen
+        max_w = math.max(120, W - 2 * opts.margin), max_h = math.max(120, H - 2 * opts.margin),
         hdr_encode = hdr_on() and true or false, ref_nits = opts.card_nits,
         show_backdrop = opts.show_backdrop and true or false,
         poster_url = img('https://image.tmdb.org/t/p/w342', meta.poster_path),
         backdrop_url = img('https://image.tmdb.org/t/p/w780', meta.backdrop_path),
         title = meta.title, year = meta.year, tagline = meta.tagline,
-        rating = meta.rating, genres = meta.genres, runtime = meta.runtime,
+        rating = meta.rating, rating_note = meta.rating_note, genres = meta.genres, runtime = meta.runtime,
         overview = meta.overview, director = meta.director, cast = meta.cast,
     }
     local spec_path = utils.join_path(cache_dir, meta.key .. '_spec.json')
@@ -295,36 +322,102 @@ local function fetch_details(id, meta, key, my_req, poster_path)
     end)
 end
 
-local function lookup()
-    req_id = req_id + 1
-    local my_req = req_id
-
-    if opts.api_key == nil or opts.api_key == '' then
-        if not warned_key then
-            warned_key = true
-            mp.osd_message('tmdb-info: set api_key in script-opts/tmdb-info.conf', 4)
+-- TV: fetch the specific episode (name/plot/rating/runtime/credits) and merge over the show meta
+local function fetch_tv_episode(show, info, key, my_req)
+    local url = string.format(
+        'https://api.themoviedb.org/3/tv/%d/season/%d/episode/%d?api_key=%s&language=%s&append_to_response=credits',
+        show.id, info.season, info.episode, opts.api_key, urlencode(opts.language))
+    run_async({ 'curl', '-s', '-L', '--max-time', '10', url }, function(ok, res)
+        if my_req ~= req_id then return end
+        local meta = {
+            id = show.id,
+            title = show.name,
+            year = show.year,
+            rating = show.rating,
+            genres = show.genres,
+            overview = show.overview,
+            poster_path = show.poster_path,
+            backdrop_path = show.backdrop_path,
+        }
+        local label = string.format('S%02dE%02d', info.season, info.episode)
+        meta.tagline = label
+        if ok and res and res.stdout and res.stdout ~= '' then
+            local d = utils.parse_json(res.stdout)
+            if d and not d.status_code then -- status_code => TMDb error (e.g. episode missing)
+                if d.name and d.name ~= '' then meta.tagline = label .. '  \226\128\162  ' .. d.name end -- "S04E08 • Name"
+                if d.overview and d.overview ~= '' then meta.overview = d.overview end
+                -- episode rating only if it has enough votes (fresh episodes have noisy 1-4 vote scores)
+                if d.vote_average and d.vote_average > 0 and (d.vote_count or 0) >= 5 then
+                    meta.rating = d.vote_average; meta.rating_note = 'episode'
+                end
+                if d.runtime and d.runtime > 0 then meta.runtime = d.runtime end
+                if d.credits then
+                    if d.credits.crew then
+                        for _, c in ipairs(d.credits.crew) do
+                            if c.job == 'Director' then
+                                meta.director = meta.director and (meta.director .. ', ' .. c.name) or c.name
+                            end
+                        end
+                    end
+                    local names = {}
+                    for _, c in ipairs(d.credits.guest_stars or {}) do
+                        if #names < 4 then names[#names + 1] = c.name else break end
+                    end
+                    if #names > 0 then meta.cast = table.concat(names, ', ') end
+                end
+            end
         end
-        return
-    end
+        -- label the rating source so "8.5" isn't ambiguous (show avg vs this episode)
+        if meta.rating and not meta.rating_note then meta.rating_note = 'series' end
+        save_cache(key, meta)
+        show_meta(meta, key, my_req, meta.poster_path)
+    end)
+end
 
-    local title, year = parse_filename()
-    if not title then current = nil; return end
+local function lookup_tv(info, key, my_req)
+    local url = string.format('https://api.themoviedb.org/3/search/tv?api_key=%s&query=%s&language=%s',
+        opts.api_key, urlencode(info.title), urlencode(opts.language))
+    run_async({ 'curl', '-s', '-L', '--max-time', '10', url }, function(ok, res)
+        if my_req ~= req_id then return end
+        if not ok or not res or not res.stdout or res.stdout == '' then no_match(my_req, key); return end
+        local j = utils.parse_json(res.stdout)
+        if not j or not j.results or #j.results == 0 then no_match(my_req, key); return end
+        local r = j.results[1]
+        local genre_names = {}
+        if r.genre_ids then
+            for _, gid in ipairs(r.genre_ids) do
+                if TV_GENRES[gid] then genre_names[#genre_names + 1] = TV_GENRES[gid] end
+            end
+        end
+        local show = {
+            id = r.id,
+            name = r.name or r.original_name or info.title,
+            year = r.first_air_date and r.first_air_date:match('^(%d%d%d%d)') or nil,
+            rating = (r.vote_average and r.vote_average > 0) and r.vote_average or nil,
+            genres = table.concat(genre_names, ', '),
+            overview = r.overview or '',
+            poster_path = r.poster_path,
+            backdrop_path = r.backdrop_path,
+        }
+        if r.id then
+            fetch_tv_episode(show, info, key, my_req)
+        else
+            local meta = {
+                title = show.name, year = show.year, rating = show.rating, genres = show.genres,
+                overview = show.overview, poster_path = show.poster_path, backdrop_path = show.backdrop_path,
+                tagline = string.format('S%02dE%02d', info.season, info.episode),
+                rating_note = show.rating and 'series' or nil,
+            }
+            save_cache(key, meta)
+            show_meta(meta, key, my_req, meta.poster_path)
+        end
+    end)
+end
 
-    fetching = true
-    local key = cache_key(title, year)
-
-    -- cache (metadata). show_meta re-validates the composed-card bitmap cache itself.
-    local cached = load_cache(key)
-    if cached then
-        if cached.found == false then no_match(my_req, nil); return end
-        show_meta(cached, key, my_req, cached.poster_path)
-        return
-    end
-
-    local q = urlencode(title)
+local function lookup_movie(info, key, my_req)
     local url = string.format('https://api.themoviedb.org/3/search/movie?api_key=%s&query=%s&language=%s',
-        opts.api_key, q, urlencode(opts.language))
-    if year then url = url .. '&year=' .. year end
+        opts.api_key, urlencode(info.title), urlencode(opts.language))
+    if info.year then url = url .. '&year=' .. info.year end
 
     run_async({ 'curl', '-s', '-L', '--max-time', '10', url }, function(ok, res)
         if my_req ~= req_id then return end
@@ -342,8 +435,8 @@ local function lookup()
         end
         local meta = {
             id = r.id,
-            title = r.title or r.original_title or title,
-            year = (r.release_date and r.release_date:match('^(%d%d%d%d)')) or year,
+            title = r.title or r.original_title or info.title,
+            year = (r.release_date and r.release_date:match('^(%d%d%d%d)')) or info.year,
             rating = (r.vote_average and r.vote_average > 0) and r.vote_average or nil,
             genres = table.concat(genre_names, ', '),
             overview = r.overview or '',
@@ -357,6 +450,39 @@ local function lookup()
             show_meta(meta, key, my_req, r.poster_path)
         end
     end)
+end
+
+local function lookup()
+    req_id = req_id + 1
+    local my_req = req_id
+
+    if opts.api_key == nil or opts.api_key == '' then
+        if not warned_key then
+            warned_key = true
+            mp.osd_message('tmdb-info: set api_key in script-opts/tmdb-info.conf', 4)
+        end
+        return
+    end
+
+    local info = parse_filename()
+    if not info then current = nil; return end
+
+    fetching = true
+    local key = cache_key(info)
+
+    -- cache (metadata). show_meta re-validates the composed-card bitmap cache itself.
+    local cached = load_cache(key)
+    if cached then
+        if cached.found == false then no_match(my_req, nil); return end
+        show_meta(cached, key, my_req, cached.poster_path)
+        return
+    end
+
+    if info.kind == 'tv' then
+        lookup_tv(info, key, my_req)
+    else
+        lookup_movie(info, key, my_req)
+    end
 end
 
 -- helper used above (declared here to keep lookup readable)

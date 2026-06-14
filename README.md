@@ -14,13 +14,20 @@ real‑time RIFE frame interpolation via TensorRT, a careful HDR pipeline, and a
   **fp16**, computed at display‑native **1440p** (not the source height — saves GPU for free) with
   scene‑change detection (`sc=True`) so hard cuts duplicate instead of morphing. Toggle with
   **`Ctrl+Shift+R`**. (`rife.vpy`, `rife_config.py`, `vs_script/`)
-- **TMDb movie‑info card** (`scripts/tmdb-info.lua`, `tmdb_card.ps1`) — pause a movie and an
+- **TMDb movie / TV info card** (`scripts/tmdb-info.lua`, `tmdb_card.ps1`) — pause a video and an
   IMDb‑style card fades in: backdrop + poster + title, tagline, ★ rating, genres, runtime, plot,
   director & cast. Parsed from the filename, fetched live from TMDb, rendered as a single bitmap.
   Shows **only while paused**; toggle with **`Ctrl+i`**.
+  - **Movies and TV episodes:** filenames with an `SxxExx` marker are detected as TV — it queries
+    the show, then the specific episode, and uses the episode's name (as the subtitle), plot,
+    runtime and director. The rating is labelled **`series`** or **`episode`** so it's never
+    ambiguous (episode rating is only used once it has enough votes, else the show's).
   - **HDR‑correct color:** on HDR video the card is encoded into **BT.2020 + PQ** at a reference
     white (`card_nits`, default 203) so it isn't oversaturated; SDR video renders at true sRGB.
     Auto‑detected from the video's transfer — no manual color tuning.
+  - **Fits any window:** the card is laid out at native size then uniformly scaled to fit the
+    window (minus margins), and the text column sizes to its widest line, so nothing is clipped
+    when not fullscreen.
   - Needs your **own free TMDb API key** (see Setup).
 - **uosc UI** ([uosc](https://github.com/tomasklaen/uosc)) with a **cleaned‑up key‑bindings menu**
   (deduplicated, grouped by action).
