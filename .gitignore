@@ -1,0 +1,17 @@
+# Generated / machine-specific — never commit
+portable_config/cache/
+portable_config/tmdb-cache/
+**/__pycache__/
+*.pyc
+
+# tmdb-info runtime artifacts
+*.bgra
+*_spec.json
+
+# TensorRT engines (huge, GPU/driver/resolution-specific — built locally)
+*.engine
+
+# logs
+*.log
+rife_log.txt
+rife-enhanced-test*.log
