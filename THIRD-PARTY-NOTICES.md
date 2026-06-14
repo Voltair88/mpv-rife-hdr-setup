@@ -1,5 +1,9 @@
 # Third‑party notices
 
+The repository's `LICENSE` (MIT) covers **only the original files authored for this repo**
+(e.g. `scripts/tmdb-info.lua`, `tmdb_card.ps1`, the RIFE configuration files). The bundled
+third‑party code below retains its own license — MIT does **not** apply to it.
+
 This repository bundles and (in some cases) **modifies** code from other open‑source projects.
 Each component is the property of its authors and remains under its original license. Please
 support and refer to the upstream projects.
