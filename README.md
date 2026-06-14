@@ -23,8 +23,10 @@ real‑time RIFE frame interpolation via TensorRT, a careful HDR pipeline, and a
     Auto‑detected from the video's transfer — no manual color tuning.
   - Needs your **own free TMDb API key** (see Setup).
 - **uosc UI** ([uosc](https://github.com/tomasklaen/uosc)) with a **cleaned‑up key‑bindings menu**
-  (deduplicated, grouped by action) and **[thumbfast](https://github.com/po5/thumbfast)** set to
-  **paused‑only** thumbnails (avoids GPU contention with RIFE during playback).
+  (deduplicated, grouped by action).
+- **Paused‑only thumbnails** ([thumbfast](https://github.com/po5/thumbfast), `scripts/thumbfast.lua`)
+  — modified so seekbar thumbnails generate **only while paused**, avoiding GPU contention with RIFE
+  during playback (which otherwise produced black/stale thumbnails).
 - **HDR tone‑mapping** config in `mpv.conf` (gpu‑next, `target-peak=1000`, etc.).
 - **Autocrop** to fill the display with **`Shift+C`** (from mpv-enhanced).
 
