@@ -26,6 +26,12 @@ support and refer to the upstream projects.
 - Distributed as part of [F0903/mpv-enhanced](https://github.com/F0903/mpv-enhanced); refer to that
   project for its origin and license. Unmodified here.
 
+### uosc OpenSubtitles downloader
+- uosc ships a built-in OpenSubtitles.com downloader (`ziggy` helper + a bundled application API key in
+  `main.lua`). That bundled key is **upstream uosc's own** and is left as-is. Subtitles themselves come
+  from **[OpenSubtitles.com](https://www.opensubtitles.com)** under their terms of service. Users may
+  substitute their own OpenSubtitles API key locally.
+
 ## Not redistributed (linked only)
 
 - **RIFE models** (v4.x weights) — [hzwer/Practical-RIFE](https://github.com/hzwer/Practical-RIFE),
@@ -34,6 +40,13 @@ support and refer to the upstream projects.
 - **vsrife** — [HolyWu/vs-rife](https://github.com/HolyWu/vs-rife) (installed separately).
 - **mpv**, **VapourSynth**, **NVIDIA TensorRT** — installed via
   [F0903/mpv-enhanced](https://github.com/F0903/mpv-enhanced).
+- **SOFA HRTF file** (for `spatial.lua` headphone virtual surround via FFmpeg's `sofalizer`) — the user
+  downloads their own, e.g. the **[SADIE II](https://www.york.ac.uk/sadie-project/database.html)**
+  database (© University of York, CC-BY / Apache-2.0 depending on subject). **Not** included here; the
+  path is set in `script-opts/spatial.conf`.
+- **VB-Audio Voicemeeter Remote API** (`VoicemeeterRemote64.dll`) — used by `voicemeeter-sync.lua` only
+  if Voicemeeter is installed. Proprietary, part of a [Voicemeeter](https://vb-audio.com/Voicemeeter/)
+  install; **not** redistributed. Loaded at runtime via LuaJIT FFI.
 
 ## Fonts — `portable_config/fonts/`
 - `uosc_icons.otf`, `uosc_textures.ttf` ship with uosc (LGPL‑2.1, as above).
