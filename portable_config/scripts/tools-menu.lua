@@ -18,6 +18,8 @@ local function open()
               value = { 'script-binding', 'tmdb_info/toggle' } },
             { title = 'Toggle sharpening (libplacebo)',
               value = { 'cycle-values', 'sharpen', '0.0', '0.35' } },
+            { title = 'Toggle virtual surround (headphones)', hint = 'Ctrl+Shift+V',
+              value = { 'script-binding', 'spatial/toggle' } },
             { title = 'Audio delay (Voicemeeter)', selectable = false, muted = true, italic = true },
             { title = 'Re-sync to current output',
               value = { 'script-message', 'resync' } },

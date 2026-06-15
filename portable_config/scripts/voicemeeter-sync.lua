@@ -175,6 +175,7 @@ end
 
 local function apply(sig)
     current_signature = sig
+    mp.set_property('user-data/voicemeeter/output', sig)   -- consumed by spatial.lua (headphone gating)
     local delay, how = lookup(sig)
     if delay ~= last_delay then
         mp.set_property_number('audio-delay', delay)
