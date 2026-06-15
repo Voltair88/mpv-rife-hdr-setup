@@ -24,9 +24,17 @@ and a few quality-of-life tools.
   also upscales sub-1440p sources with **Spline36** (vs cheap Bilinear) where the GPU has headroom.
 - **SDR / HDR auto color profiles** — `mpv.conf` applies debanding on SDR (8-bit gradients) and leaves
   HDR clean, switched automatically from `video-params/gamma`.
-- **HDR tone-mapping** — gpu-next, `target-peak=1000`, contrast recovery, etc.
-- **Scaling** — `scale=ewa_lanczossharp` + antiring (applies when RIFE is off, since RIFE already
-  resizes internally).
+- **HDR tone-mapping (QD-OLED tuned)** — gpu-next/libplacebo with `tone-mapping=reinhard` (chosen by
+  on-panel A/B), `target-peak=1000` (fixed, not auto — Windows EDID HDR luminance is unreliable),
+  `target-contrast=inf` (true-black OLED), `hdr-contrast-recovery=0.9`, and `hdr-peak-percentile=99.995`
+  for pixel-based scene-adaptive peak detection (compensates for RIFE stripping dynamic metadata).
+- **Chroma & scaling** — `cscale=spline36` (chroma always upscales, even with RIFE on → sharper colour
+  edges); `scale=ewa_lanczossharp` + antiring applies only when RIFE is off (RIFE resizes internally).
+
+> **Note on Dolby Vision / HDR10+:** the VapourSynth/RIFE pipeline strips the DV RPU / HDR10+ dynamic
+> metadata (mpv [#10438](https://github.com/mpv-player/mpv/issues/10438)) — interpolated frames have no
+> per-frame metadata to carry. DV Profile 8 still plays a correct *static* HDR10 image, and the pixel-based
+> peak detection above approximates scene adaptation. For true dynamic metadata, play with **RIFE off**.
 
 ### The movie / TV info card  (`scripts/tmdb-info.lua`, `tmdb_card.ps1`)
 Pause a video and an IMDb-style **frosted-glass card** fades in: backdrop + poster + title, tagline,
@@ -47,10 +55,12 @@ rendered to a single bitmap.
   saves the current value for the current output. *Optional — only useful if you route mpv through
   Voicemeeter.*
 - **Headphone virtual surround** (`scripts/spatial.lua`) — renders 5.1/7.1 into spatialized stereo with
-  FFmpeg's **`sofalizer`** HRTF so surround content "feels" placed on stereo headphones. Auto-applies to
-  multichannel content **only on headphone output** (gated via the Voicemeeter output above); manual
-  toggle **`Ctrl+Shift+V`**, off by default. Ships with a **measured corrective EQ** that flattens the
-  HRTF's tonal coloration, and configurable speaker angles. *Optional — needs a SOFA HRTF file.*
+  FFmpeg's **`sofalizer`** HRTF so surround content "feels" placed on stereo headphones. **Auto-engages**
+  by default (`auto=yes`) for multichannel content **only on headphone output** (gated via the Voicemeeter
+  output above) — stereo content and the stereo speakers correctly stay dry. Manual override
+  **`Ctrl+Shift+V`** cycles auto → forced-on → forced-off. Ships with a **measured corrective EQ** that
+  flattens the HRTF's tonal coloration, and configurable speaker angles. *Optional — needs a SOFA HRTF
+  file; set `auto=no` in `spatial.conf` for manual-only.*
 
 ### Subtitles & navigation
 - **One-key OpenSubtitles download** — uosc's built-in OpenSubtitles.com downloader, surfaced on
