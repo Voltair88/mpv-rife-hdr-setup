@@ -26,18 +26,33 @@ def print_log(*values: object):
 DISPLAY_H = 1440  # Samsung G95SC native height — process RIFE here, not at source 1606p
 
 
-def apply_rife(clip, factor_num, factor_den):
-    """YUV(PQ/HDR) -> RGBH -> vsrife TensorRT -> YUV420P10, at display-native height."""
-    # Clear colorspace props so zimg does NOT linearize PQ during YUV->RGB
+def apply_rife(clip, factor_num, factor_den, is_hdr=True):
+    """YUV -> RGBH -> vsrife TensorRT -> YUV420P10, at display-native height.
+
+    HDR path (is_hdr=True) is unchanged: BT.2020 matrix in, PQ/BT.2020 out. SDR sources take a
+    BT.709 path so their colours are correct (the old code forced BT.2020+PQ on everything, which
+    is wrong for SDR) AND so mpv's video-params/gamma reports SDR -> enabling the [sdr]/[hdr]
+    profiles in mpv.conf even with RIFE active.
+    """
+    if is_hdr:
+        in_matrix, out_matrix = 9, 9          # BT.2020 non-constant-luminance
+        out_transfer, out_primaries = 16, 9   # ST.2084 (PQ) + BT.2020
+    else:
+        in_matrix, out_matrix = 1, 1          # BT.709
+        out_transfer, out_primaries = 1, 1    # BT.709 transfer + primaries (SDR)
+
+    # Clear colorspace props so zimg does NOT linearize during YUV->RGB
     clip = core.std.SetFrameProps(clip, _Transfer=2, _Primaries=2, _Matrix=2, _ColorRange=0)
 
-    # Downscale to display height + convert YUV420P10 -> RGBH (fp16) in one zimg pass.
+    # Resize to display height + convert YUV -> RGBH (fp16) in one zimg pass.
     # The panel shows 1440p, so computing RIFE above that is wasted GPU (no visible gain).
     tw = round(clip.width * DISPLAY_H / clip.height / 2) * 2
-    # Bilinear (was Bicubic): cheaper zimg resampling on the CPU. This downscale is only
-    # 1606->1440 (~0.9x), so the quality difference is negligible but the CPU saving is real,
-    # helping sustain realtime (avoid A-V desync) at a lower thread count.
-    clip = core.resize.Bilinear(clip, width=tw, height=DISPLAY_H, format=config.gpu_format, matrix_in=9, range_in=1, range=0)
+    # Kernel by direction: cheap Bilinear when DOWNscaling 4K (the realtime-critical path -- only
+    # ~0.9x, so quality loss is negligible and the CPU saving sustains realtime). Spline36 when
+    # UPscaling sub-1440p sources (e.g. 1080p live-action): those frames are small/light to decode,
+    # so the extra CPU is affordable and the upscale quality gain is real (Bilinear upscaling is soft).
+    in_kernel = core.resize.Spline36 if clip.height < DISPLAY_H else core.resize.Bilinear
+    clip = in_kernel(clip, width=tw, height=DISPLAY_H, format=config.gpu_format, matrix_in=in_matrix, range_in=1, range=0)
 
     from vsrife import rife
     clip = rife(
@@ -52,11 +67,11 @@ def apply_rife(clip, factor_num, factor_den):
         trt_static_shape=True,
     )
 
-    # RGBH -> YUV420P10, restore HDR (PQ / bt.2020 / limited) props
-    # Bilinear (was Bicubic): runs at 2x output rate (47.952fps) so it's the bigger CPU cost;
-    # only chroma 444->420 here (no luma resize), so bilinear is visually ~identical at 1440p.
-    clip = core.resize.Bilinear(clip, format=vs.YUV420P10, matrix=9, range_in=0, range=1, chromaloc=2)
-    clip = core.std.SetFrameProps(clip, _Transfer=16, _Primaries=9, _Matrix=9, _ColorRange=1)
+    # RGBH -> YUV420P10, restore source-appropriate props (PQ/BT.2020 for HDR, BT.709 for SDR).
+    # Bilinear here: runs at 2x output rate (47.952fps) so it's the bigger CPU cost; only chroma
+    # 444->420 (no luma resize), so bilinear is visually ~identical at 1440p.
+    clip = core.resize.Bilinear(clip, format=vs.YUV420P10, matrix=out_matrix, range_in=0, range=1, chromaloc=2)
+    clip = core.std.SetFrameProps(clip, _Transfer=out_transfer, _Primaries=out_primaries, _Matrix=out_matrix, _ColorRange=1)
     return clip
 
 
@@ -68,9 +83,20 @@ if container_fps < config.disable_fps_threshold:  # type: ignore[name-defined]
     print_log(f"vsrife TRT: {float(container_fps_frac):.3f}fps x{factor_num}/{factor_den} -> {float(container_fps_frac * target_fps_frac):.3f}fps")
 
     clip = video_in  # type: ignore[name-defined]
-    print_log(f"Resolution: {clip.width}x{clip.height} -> 1440p | model={config.rife_model} scale={config.scale} sc={config.sc}")
 
-    clip = apply_rife(clip, factor_num, factor_den)
+    # Detect source HDR vs SDR from the props mpv tagged on the clip. Default to HDR (the original
+    # behaviour) on any uncertainty, so the HDR path can never regress.
+    try:
+        src_transfer = clip.get_frame(0).props.get("_Transfer", 16)
+        is_hdr = src_transfer in (16, 18)   # 16=ST.2084/PQ, 18=ARIB B67/HLG
+    except Exception as e:
+        print_log(f"transfer probe failed ({e}); assuming HDR")
+        is_hdr = True
+
+    print_log(f"Resolution: {clip.width}x{clip.height} -> 1440p | {'HDR' if is_hdr else 'SDR'} | "
+              f"model={config.rife_model} scale={config.scale} sc={config.sc}")
+
+    clip = apply_rife(clip, factor_num, factor_den, is_hdr)
 
     print_log("vsrife TRT applied successfully.")
     clip.set_output()
