@@ -24,6 +24,16 @@ local opts = {
     hdr_compensate = 'auto', -- auto (only HDR pq/hlg video) | yes (always) | no (never)
     card_nits = 203,         -- card brightness on HDR (lower = dimmer)
     show_backdrop = true,
+    backdrop_blur = true,    -- frosted-glass blurred backdrop
+    -- Visibility: the card behaves like a hover zone in its corner -- it shows while the cursor is
+    -- inside the card's area (moving), and hides when the cursor moves outside it or leaves.
+    fade = true,             -- smooth fade in/out
+    fade_duration = 0.18,    -- seconds for a full fade
+    fade_steps = 5,          -- opacity steps in the fade (more = smoother, bigger cache file)
+    -- A small frosted "Loading…" pill (animated spinner) shown while the card is still being
+    -- fetched/composed, so a mouse reveal isn't just empty. Hidden the instant the card appears.
+    loading_indicator = true,
+    loading_delay = 0.15,    -- seconds of "not ready" before the pill appears (avoids flashing)
 }
 options.read_options(opts, 'tmdb-info')
 
@@ -51,16 +61,14 @@ local card_helper = mp.command_native({ 'expand-path', '~~/tmdb_card.ps1' })
 
 -- state
 local current = nil      -- current movie meta table (or false = confirmed no-match)
-local visible = false
+local visible = false    -- target state: should the card be on screen right now?
+local pinned = false     -- Ctrl+i override: stay visible, ignore the idle auto-hide
 local req_id = 0         -- generation counter to discard stale async responses
 local warned_key = false
-local manual = false     -- Ctrl+i override: show even while playing
 local fetching = false   -- a lookup is in flight (avoids duplicate fetches)
-local compose_card       -- forward declaration (draw() calls it; defined in the data section)
-
--- the card is shown only while paused, unless the user forced it with the toggle key
-local function is_paused() return mp.get_property_native('pause') == true end
-local function want_show() return manual or is_paused() end
+local compose_card       -- forward declaration (reveal() calls it; defined in the data section)
+local reveal             -- forward declaration (compose_card callback / events call it)
+local lookup             -- forward declaration (reveal() / events call it)
 
 -- HDR detection: the video's transfer is the reliable signal (output is HDR exactly when video is)
 local function is_hdr()
@@ -158,52 +166,248 @@ end
 ------------------------------------------------------------------- rendering
 
 -- cache filename encodes everything that changes the rendered card, so any change regenerates
+local function fade_n() return (opts.fade and opts.fade_steps > 0) and opts.fade_steps or 0 end
+
 local function card_path(key, W, H)
-    return utils.join_path(cache_dir, string.format('%s_card_%dx%d_p%d_b%d_hdr%d_n%d.bgra',
+    return utils.join_path(cache_dir, string.format('%s_card_%dx%d_p%d_b%d_bl%d_hdr%d_n%d_f%d.bgra',
         key, W, H, math.floor(opts.poster_width), opts.show_backdrop and 1 or 0,
-        hdr_on() and 1 or 0, math.floor(opts.card_nits)))
+        opts.backdrop_blur and 1 or 0, hdr_on() and 1 or 0, math.floor(opts.card_nits), fade_n()))
 end
 
-local function hide()
-    mp.command_native({ 'overlay-remove', CARD_ID })
-    visible = false
-    manual = false
+-- Build the card silently in the background for the current display size, so hovering is instant.
+-- Debounced so a burst of osd-dimensions changes (a resize drag) composes once, for the final size.
+local prefetch_timer = nil
+local function schedule_prefetch()
+    if prefetch_timer then prefetch_timer:kill() end
+    prefetch_timer = mp.add_timeout(0.25, function()
+        prefetch_timer = nil
+        local meta = current
+        if not (meta and meta ~= false and meta.key) then return end
+        local dim = mp.get_property_native('osd-dimensions')
+        if not (dim and dim.w and dim.w > 0) then return end
+        local out = card_path(meta.key, dim.w, dim.h)
+        if meta.card_out ~= out or not meta.card_bgra then
+            compose_card(meta, req_id, dim.w, dim.h, out) -- compose_card guards against overlaps
+        end
+    end)
 end
 
+-- The composed bitmap is bigger than the visible card by a shadow margin (meta.card_sm) on each
+-- side, and (when fading) packs N+1 opacity frames. Frame 0 = full opacity; frame N = most
+-- transparent; level N+1 = removed. The card reveals on mouse move and hides on idle, with fade.
+local vis_rect = nil               -- {x,y,w,h} of the VISIBLE card on screen, for mouse hit-test
+local cur_lvl                      -- current opacity level (nil/large = hidden)
+local placed = false               -- is the overlay currently added?
+local anim_token = 0               -- cancels an in-flight fade when a new one starts
 local draw_tries = 0
-local function draw(meta)
+
+local function point_in(x, y, r)
+    return r and x and y and x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h
+end
+
+------------------------------------------------------------------- loading indicator
+-- A transient frosted "Loading..." pill (ASS, so it's instant + color-managed by mpv) shown while
+-- the card is still being fetched/composed, and removed the moment the card blits.
+local SPIN = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
+local loading_ov, loading_spin_timer, loading_delay_timer
+local loading_shown = false
+local loading_frame = 1
+local loading_geo = nil
+
+local function loading_render()
+    if not (loading_ov and loading_geo) then return end
+    local gp = loading_geo
+    local bg = string.format(
+        '{\\an7\\pos(%d,%d)\\bord1\\shad0\\1c&H1A1512&\\1a&H38&\\3c&HD8D8D8&\\3a&H70&\\p1}%s{\\p0}',
+        gp.x, gp.y, gp.path)
+    local tx = string.format(
+        '{\\an4\\pos(%d,%d)\\fs%d\\b1\\bord1\\shad0\\1c&HFFFFFF&\\3c&H000000&}%s  Loading…',
+        gp.tx, gp.ty, gp.fs, SPIN[loading_frame])
+    loading_ov.data = bg .. '\n' .. tx
+    loading_ov:update()
+end
+
+local function loading_actually_show()
+    local dim = mp.get_property_native('osd-dimensions')
+    if not dim or not dim.w or dim.w == 0 then return end
+    local W, H = dim.w, dim.h
+    local fs = math.max(14, math.floor(H * 0.022))
+    local pad = math.floor(fs * 0.75)
+    local r = math.max(6, math.floor(fs * 0.5))
+    local h = fs + 2 * pad
+    local w = math.floor(fs * 8.2) + 2 * pad
+    local m, pos = opts.margin, opts.position
+    local x = (pos == 'top-right' or pos == 'bottom-right') and (W - m - w) or m
+    local y = (pos == 'bottom-left' or pos == 'bottom-right') and (H - m - h) or m
+    -- rounded-rect path (origin at pill top-left via \an7\pos); corners are beziers to the vertex
+    local path = string.format(
+        'm %d 0 l %d 0 b %d 0 %d 0 %d %d l %d %d b %d %d %d %d %d %d l %d %d b 0 %d 0 %d 0 %d l 0 %d b 0 0 0 0 %d 0',
+        r, w - r, w, w, w, r, w, h - r, w, h, w, h, w - r, h, r, h, h, h, h - r, r, r)
+    if not loading_ov then loading_ov = mp.create_osd_overlay('ass-events') end
+    loading_ov.res_x = W; loading_ov.res_y = H; loading_ov.z = 5
+    loading_geo = { x = x, y = y, fs = fs, path = path, tx = x + pad + math.floor(fs * 0.2), ty = y + math.floor(h / 2) }
+    loading_shown = true
+    loading_render()
+    if loading_spin_timer then loading_spin_timer:kill() end
+    loading_spin_timer = mp.add_periodic_timer(0.09, function()
+        loading_frame = (loading_frame % #SPIN) + 1
+        loading_render()
+    end)
+end
+
+local function loading_hide()
+    if loading_delay_timer then loading_delay_timer:kill(); loading_delay_timer = nil end
+    if loading_spin_timer then loading_spin_timer:kill(); loading_spin_timer = nil end
+    if loading_ov and loading_shown then loading_ov:remove() end
+    loading_shown = false
+    loading_geo = nil
+end
+
+local function loading_request()
+    if not opts.loading_indicator then return end
+    if loading_shown or loading_delay_timer then return end
+    loading_delay_timer = mp.add_timeout(opts.loading_delay, function()
+        loading_delay_timer = nil
+        loading_actually_show()
+    end)
+end
+
+local function blit_level(meta, lvl)
+    local N = fade_n()
+    if lvl > N then
+        if placed then mp.command_native({ 'overlay-remove', CARD_ID }); placed = false end
+        return
+    end
+    if lvl < 0 then lvl = 0 end
+    local bw, bh = meta.card_w, meta.card_h
+    local offset = lvl * bw * bh * 4
+    mp.command_native({ 'overlay-add', CARD_ID, meta._ox, meta._oy, meta.card_bgra,
+        offset, 'bgra', bw, bh, (4 * bw) })
+    placed = true
+    loading_hide() -- the card is on screen now; drop the loading pill
+end
+
+-- top-left of a vcw x vch card for the configured anchor + margin
+local function anchor_xy(W, H, vcw, vch)
+    local m, pos = opts.margin, opts.position
+    local x = (pos == 'top-right' or pos == 'bottom-right') and (W - m - vcw) or m
+    local y = (pos == 'bottom-left' or pos == 'bottom-right') and (H - m - vch) or m
+    if x < m then x = m end
+    if y < m then y = m end
+    return x, y
+end
+
+-- compute & store the overlay placement so the VISIBLE card (not its bleed) sits at the margin
+local function position_overlay(meta, W, H)
+    local sm = meta.card_sm or 0
+    local vcw, vch = meta.card_w - 2 * sm, meta.card_h - 2 * sm
+    local vx, vy = anchor_xy(W, H, vcw, vch)
+    meta._ox = math.max(0, math.floor(vx - sm))
+    meta._oy = math.max(0, math.floor(vy - sm))
+    vis_rect = { x = meta._ox + sm, y = meta._oy + sm, w = vcw, h = vch }
+end
+
+-- The on-screen rectangle that triggers the card (its own area). Uses the real composed size when
+-- known for the current display size; otherwise a sensible estimate so the corner is hoverable
+-- before the first compose finishes.
+local function card_rect()
+    local dim = mp.get_property_native('osd-dimensions')
+    if not (dim and dim.w and dim.w > 0) then return nil end
+    local W, H = dim.w, dim.h
+    local meta = current
+    if meta and meta ~= false and meta.card_w and meta.card_out == card_path(meta.key, W, H) then
+        local sm = meta.card_sm or 0
+        local vcw, vch = meta.card_w - 2 * sm, meta.card_h - 2 * sm
+        local x, y = anchor_xy(W, H, vcw, vch)
+        return { x = x, y = y, w = vcw, h = vch }
+    end
+    local vcw = math.min(W - 2 * opts.margin, math.floor(opts.poster_width * 4))
+    local vch = math.floor(opts.poster_width * 1.6)
+    local x, y = anchor_xy(W, H, vcw, vch)
+    return { x = x, y = y, w = vcw, h = vch }
+end
+
+local function anim_step(meta, target, tok)
+    if tok ~= anim_token then return end
+    if cur_lvl == target then return end
+    cur_lvl = cur_lvl + (target > cur_lvl and 1 or -1)
+    blit_level(meta, cur_lvl)
+    if cur_lvl ~= target then
+        local N = fade_n()
+        local dt = (N > 0) and (opts.fade_duration / (N + 1)) or 0
+        mp.add_timeout(math.max(0.01, dt), function() anim_step(meta, target, tok) end)
+    end
+end
+
+local function animate_to(meta, target)
+    anim_token = anim_token + 1
+    local tok = anim_token
+    if not (opts.fade and fade_n() > 0) then -- no fade: jump straight to the target level
+        cur_lvl = target
+        blit_level(meta, cur_lvl)
+        return
+    end
+    if cur_lvl == nil then cur_lvl = fade_n() + 1 end -- start fully hidden
+    anim_step(meta, target, tok)
+end
+
+-- bring the card on screen (fade in). Composes/looks up first if needed.
+reveal = function()
+    if not (current and current ~= false) then
+        if current == nil then
+            if not fetching then lookup() end
+            loading_request() -- metadata is being fetched
+        end
+        return
+    end
+    local meta = current
+    visible = true -- target state, set early so the compose/osd-retry callbacks finish the reveal
     local dim = mp.get_property_native('osd-dimensions')
     if not dim or not dim.w or dim.w == 0 then
         if draw_tries < 12 then
             draw_tries = draw_tries + 1
-            mp.add_timeout(0.25, function() if current == meta then draw(meta) end end)
+            mp.add_timeout(0.25, function() if current == meta and visible then reveal() end end)
         end
+        loading_request()
         return
     end
     draw_tries = 0
-
     local W, H = dim.w, dim.h
-
-    -- ensure the composed card for the current display size + style is ready
     local out = card_path(meta.key, W, H)
     if meta.card_out ~= out or not meta.card_bgra then
-        compose_card(meta, req_id, W, H, out)
+        compose_card(meta, req_id, W, H, out) -- not ready yet; its callback re-calls reveal()
     end
-    if not (meta.card_bgra and meta.card_out == out) then return end -- not ready; redraws on completion
+    if not (meta.card_bgra and meta.card_out == out) then
+        loading_request() -- bitmap is still composing
+        return
+    end
+    position_overlay(meta, W, H)
+    animate_to(meta, 0) -- level 0 = full opacity
+end
 
-    local cw, ch = meta.card_w, meta.card_h
-    local m = opts.margin
-    local pos = opts.position
-    local X0 = (pos == 'top-right' or pos == 'bottom-right') and (W - m - cw) or m
-    local Y0 = (pos == 'bottom-left' or pos == 'bottom-right') and (H - m - ch) or m
-    if X0 < m then X0 = m end
-    if Y0 < m then Y0 = m end
+-- take the card off screen (fade out)
+local function conceal()
+    visible = false
+    loading_hide()
+    if current and current ~= false and placed then
+        animate_to(current, fade_n() + 1)
+    else
+        anim_token = anim_token + 1
+        if placed then mp.command_native({ 'overlay-remove', CARD_ID }); placed = false end
+        cur_lvl = fade_n() + 1
+    end
+end
 
+-- hard remove (no fade) + reset, for file changes
+local function hide_now()
+    anim_token = anim_token + 1
+    loading_hide()
     mp.command_native({ 'overlay-remove', CARD_ID })
-    mp.command_native_async(
-        { 'overlay-add', CARD_ID, math.floor(X0), math.floor(Y0), meta.card_bgra, 0, 'bgra', cw, ch, (4 * cw) },
-        function() end)
-    visible = true
+    placed = false
+    visible = false
+    pinned = false
+    cur_lvl = fade_n() + 1
+    vis_rect = nil
 end
 
 ------------------------------------------------------------------- data
@@ -222,14 +426,14 @@ local function load_cache(key)
 end
 
 -- Render the whole card (backdrop + panel + poster + text) into one bitmap via tmdb_card.ps1.
--- Assigned into the forward-declared local so draw() can call it.
+-- Assigned into the forward-declared local so reveal() can call it.
 compose_card = function(meta, my_req, W, H, out)
     if not meta.key or W == 0 or H == 0 or meta.card_pending then return end
     -- cache hit: the file for this signature exists and we know its dimensions
     local dims = meta.card_dims and meta.card_dims[out]
     if dims and io_exists(out) then
-        meta.card_bgra = out; meta.card_w = dims.w; meta.card_h = dims.h; meta.card_out = out
-        if current == meta and visible then draw(meta) end
+        meta.card_bgra = out; meta.card_w = dims.w; meta.card_h = dims.h; meta.card_sm = dims.sm; meta.card_out = out
+        if current == meta and visible then reveal() end
         return
     end
     meta.card_pending = true
@@ -240,6 +444,7 @@ compose_card = function(meta, my_req, W, H, out)
         max_w = math.max(120, W - 2 * opts.margin), max_h = math.max(120, H - 2 * opts.margin),
         hdr_encode = hdr_on() and true or false, ref_nits = opts.card_nits,
         show_backdrop = opts.show_backdrop and true or false,
+        backdrop_blur = opts.backdrop_blur and true or false, fade_steps = fade_n(),
         poster_url = img('https://image.tmdb.org/t/p/w342', meta.poster_path),
         backdrop_url = img('https://image.tmdb.org/t/p/w780', meta.backdrop_path),
         title = meta.title, year = meta.year, tagline = meta.tagline,
@@ -255,13 +460,14 @@ compose_card = function(meta, my_req, W, H, out)
             meta.card_pending = false
             if my_req ~= req_id then return end
             local o = res and res.stdout or ''
-            local w, h = o:match('(%d+)%s+(%d+)')
+            local w, h, sm = o:match('(%d+)%s+(%d+)%s+(%d+)')
             if ok and w then
-                meta.card_bgra = out; meta.card_w = tonumber(w); meta.card_h = tonumber(h); meta.card_out = out
+                meta.card_bgra = out; meta.card_w = tonumber(w); meta.card_h = tonumber(h)
+                meta.card_sm = tonumber(sm or '0'); meta.card_out = out
                 meta.card_dims = meta.card_dims or {}
-                meta.card_dims[out] = { w = meta.card_w, h = meta.card_h }
+                meta.card_dims[out] = { w = meta.card_w, h = meta.card_h, sm = meta.card_sm }
                 save_cache(meta.key, meta)
-                if current == meta and visible then draw(meta) end
+                if current == meta and visible then reveal() end
             else
                 msg.warn('card compose failed: ' .. (o ~= '' and o or 'unknown'))
             end
@@ -274,10 +480,8 @@ local function show_meta(meta, key, my_req, _poster_path)
     meta.key = key
     meta.card_bgra = nil; meta.card_out = nil -- force draw -> compose_card (re-validates the cache)
     current = meta
-    -- prefetch the composed card now (if the display size is known) so pausing is instant
-    local dim = mp.get_property_native('osd-dimensions')
-    if dim and dim.w and dim.w > 0 then compose_card(meta, my_req, dim.w, dim.h, card_path(key, dim.w, dim.h)) end
-    if want_show() then draw(meta) end
+    schedule_prefetch() -- build the card in the background (now or once the display size is known)
+    if visible or pinned then reveal() end -- e.g. cursor is already over the area / pinned
 end
 
 local function no_match(my_req, key)
@@ -285,7 +489,8 @@ local function no_match(my_req, key)
     fetching = false
     current = false
     if key then save_cache(key, { found = false }) end
-    if want_show() then mp.osd_message('tmdb-info: no match for this file', 2) end
+    loading_hide()
+    if visible or pinned then mp.osd_message('tmdb-info: no match for this file', 2) end
 end
 
 -- 2nd call: runtime + tagline + credits (director/cast) in one request, then show
@@ -452,7 +657,7 @@ local function lookup_movie(info, key, my_req)
     end)
 end
 
-local function lookup()
+lookup = function()
     req_id = req_id + 1
     local my_req = req_id
 
@@ -495,39 +700,48 @@ end
 ------------------------------------------------------------------- events
 
 mp.register_event('file-loaded', function()
-    hide()
+    hide_now()
     current = nil
     fetching = false
     draw_tries = 0
-    -- prefetch metadata + poster now so the first pause is instant; draw() is gated to paused
+    -- prefetch metadata + poster now so the first reveal is instant
     if opts.auto_show then lookup() end
 end)
 
-mp.register_event('end-file', function() hide() end)
+mp.register_event('end-file', function() hide_now() end)
 
--- show the card only while paused; hide it on resume
-mp.observe_property('pause', 'bool', function(_, paused)
-    if paused then
-        if current and current ~= false then
-            draw(current)
-        elseif current == nil and not fetching then
-            lookup() -- e.g. api key was just added, or prefetch was skipped
-        end
-    elseif not manual then
-        hide()
+-- Rebuild the card in the background whenever the display size is known/changes (it's keyed on WxH):
+-- catches the post-load moment dimensions first become valid, plus window resizes / fullscreen.
+mp.observe_property('osd-dimensions', 'native', function() schedule_prefetch() end)
+
+-- Visibility = the card is a hover zone in its corner: it shows while the cursor moves inside its
+-- own area, and hides when the cursor moves outside it (or leaves the window).
+mp.observe_property('mouse-pos', 'native', function(_, m)
+    if not m then return end
+    if pinned then return end
+    if m.hover == false then                 -- cursor left the window
+        if visible then conceal() end
+        return
+    end
+    local r = card_rect()
+    if r and point_in(m.x, m.y, r) then
+        reveal()
+    elseif visible then
+        conceal()
     end
 end)
 
--- manual override: works regardless of pause state
+-- Ctrl+i: pin the card visible (ignores hover); press again to unpin + hide
 mp.add_key_binding(nil, 'toggle', function()
-    if visible then
-        hide()
+    if pinned then
+        pinned = false
+        conceal()
     else
-        manual = true
+        pinned = true
         if current and current ~= false then
-            draw(current)
+            visible = true; reveal()
         elseif not fetching then
-            lookup()
+            visible = true; lookup()
         end
     end
 end)

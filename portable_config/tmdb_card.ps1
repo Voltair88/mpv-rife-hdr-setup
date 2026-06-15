@@ -39,6 +39,21 @@ public static class TmdbHdr {
             buf[i + 2] = (byte)(Pq(R) * 255.0 + 0.5);
         }
     }
+
+    // Pack 'full' plus n alpha-scaled copies into one buffer for fade frames.
+    // Frame 0 = full opacity; frame k (1..n) = opacity (n+1-k)/(n+1). mpv BGRA is premultiplied,
+    // so reducing opacity by f means scaling EVERY channel (incl. alpha) by f.
+    public static byte[] BuildPacked(byte[] full, int n) {
+        int L = full.Length;
+        byte[] outb = new byte[L * (n + 1)];
+        System.Array.Copy(full, 0, outb, 0, L);
+        for (int k = 1; k <= n; k++) {
+            double f = (double)(n + 1 - k) / (n + 1);
+            int o = L * k;
+            for (int i = 0; i + 3 < L; i++) outb[o + i] = (byte)(full[i] * f + 0.5);
+        }
+        return outb;
+    }
 }
 '@
 
@@ -78,6 +93,49 @@ function Get-Img([string]$url) {
     catch { return $null }
 }
 
+# Soft drop shadow: stamp $silPath (already positioned) as black-alpha onto a temp, blur it by
+# downscaling then drawing back up onto $g (respecting $g's current clip). Cheap GDI-only blur.
+function Draw-SoftShadow($g, $silPath, [int]$bw, [int]$bh, [int]$alpha, [int]$blurF) {
+    $tmpb = New-Object System.Drawing.Bitmap($bw, $bh, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $tg = [System.Drawing.Graphics]::FromImage($tmpb)
+    $tg.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $tg.FillPath((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($alpha, 0, 0, 0))), $silPath)
+    $tg.Dispose()
+    $sw = [Math]::Max(2, [int]($bw / $blurF)); $sh = [Math]::Max(2, [int]($bh / $blurF))
+    $small = New-Object System.Drawing.Bitmap($sw, $sh, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $sg = [System.Drawing.Graphics]::FromImage($small)
+    $sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
+    $sg.DrawImage($tmpb, (New-Object System.Drawing.Rectangle(0, 0, $sw, $sh)))
+    $sg.Dispose()
+    $old = $g.InterpolationMode
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
+    $g.DrawImage($small, (New-Object System.Drawing.Rectangle(0, 0, $bw, $bh)))
+    $g.InterpolationMode = $old
+    $tmpb.Dispose(); $small.Dispose()
+}
+
+# Cover-crop a backdrop into the card rect; when $blur, route through a tiny intermediate bitmap
+# (downscale -> upscale) for a fast frosted-glass blur. $ia dims/desaturates.
+function Draw-BlurredBackdrop($g, $bd, [int]$ox, [int]$oy, [int]$cw, [int]$ch, $ia, [bool]$blur) {
+    $dstA = $cw / $ch; $srcA = $bd.Width / $bd.Height
+    if ($srcA -gt $dstA) { $sh = $bd.Height; $sw = [int]($bd.Height * $dstA); $sx = [int](($bd.Width - $sw) / 2); $sy = 0 }
+    else { $sw = $bd.Width; $sh = [int]($bd.Width / $dstA); $sx = 0; $sy = [int](($bd.Height - $sh) / 2) }
+    $dest = New-Object System.Drawing.Rectangle($ox, $oy, $cw, $ch)
+    if ($blur) {
+        $bw = [Math]::Max(8, [int]($cw / 12)); $bh = [Math]::Max(8, [int]($ch / 12))
+        $tmpb = New-Object System.Drawing.Bitmap($bw, $bh, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $tg = [System.Drawing.Graphics]::FromImage($tmpb)
+        $tg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $tg.DrawImage($bd, (New-Object System.Drawing.Rectangle(0, 0, $bw, $bh)), [single]$sx, [single]$sy, [single]$sw, [single]$sh, [System.Drawing.GraphicsUnit]::Pixel)
+        $tg.Dispose()
+        $g.DrawImage($tmpb, $dest, [single]0, [single]0, [single]$bw, [single]$bh, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+        $tmpb.Dispose()
+    }
+    else {
+        $g.DrawImage($bd, $dest, [single]$sx, [single]$sy, [single]$sw, [single]$sh, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+    }
+}
+
 try {
     Add-Type -AssemblyName System.Drawing
     $s = Get-Content -LiteralPath $Spec -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -92,7 +150,9 @@ try {
 
     $hdrEncode = [bool]$s.hdr_encode
     $refNits = if ($s.ref_nits) { [double]$s.ref_nits } else { 203.0 }
-    $iaBd = New-ColorAttrs 1.0 0.42 1.0   # backdrop only dimmed for legibility (no color change)
+    $fadeSteps = if ($s.fade_steps) { [int]$s.fade_steps } else { 0 }
+    $doBlur = if ($s.PSObject.Properties['backdrop_blur']) { [bool]$s.backdrop_blur } else { $true }
+    $iaBd = New-ColorAttrs 0.85 0.5 1.0   # frosted backdrop: slightly desaturated + dimmed
 
     $poster = Get-Img $s.poster_url
     $backdrop = $null
@@ -173,23 +233,33 @@ try {
             $plotH = [int][Math]::Ceiling($sz.Height)
         }
 
+        # credit (Dir/Cast) wraps within the column to at most 2 lines (ellipsis beyond), so a long
+        # cast no longer clips off the right edge; the card just grows a line taller when it wraps.
+        $creditH = 0
+        if ($credit) {
+            $creditMaxH = 2 * (LineH $fCredit)
+            $csz = $mg.MeasureString([string]$credit, $fCredit, (New-Object System.Drawing.SizeF($text_w, $creditMaxH)), $fmt)
+            $creditH = [int][Math]::Ceiling($csz.Height)
+        }
+
         $hTitle = LineH $fTitle
         $hTag = if ($tagline) { $sp_small + (LineH $fTag) } else { 0 }
         $hMeta = LineH $fMeta
         $hPlot = if ($plotH -gt 0) { $sp2 + $plotH } else { 0 }
-        $hCredit = if ($credit) { $sp2 + (LineH $fCredit) } else { 0 }
+        $hCredit = if ($credit) { $sp2 + $creditH } else { 0 }
         $text_h = $hTitle + $hTag + $sp1 + $hMeta + $hPlot + $hCredit
 
         $content_h = [Math]::Max($ph, $text_h)
         $cardW = $pad + $pw + $colGap + $text_w + $pad
         $cardH = $pad + $content_h + $pad
+        $shadow = [int][Math]::Round($Hu * 0.004)   # tiny transparent bleed for clean rounded-corner/border AA (no drop shadow)
 
         return @{
-            pad = $pad; radius = $radius; sp1 = $sp1; sp2 = $sp2; sp_small = $sp_small
+            pad = $pad; radius = $radius; sp1 = $sp1; sp2 = $sp2; sp_small = $sp_small; shadow = $shadow
             pw = $pw; ph = $ph; colGap = $colGap; text_w = $text_w
             fTitle = $fTitle; fTag = $fTag; fMeta = $fMeta; fMetaB = $fMetaB; fBody = $fBody; fCredit = $fCredit
             hTitle = $hTitle; hTag = $hTag; hMeta = $hMeta; hPlot = $hPlot; hCredit = $hCredit
-            plotH = $plotH; text_h = $text_h; content_h = $content_h; cardW = $cardW; cardH = $cardH
+            plotH = $plotH; creditH = $creditH; text_h = $text_h; content_h = $content_h; cardW = $cardW; cardH = $cardH
         }
     }
 
@@ -201,43 +271,55 @@ try {
     $pad = $L.pad; $radius = $L.radius; $sp1 = $L.sp1; $sp2 = $L.sp2; $sp_small = $L.sp_small
     $pw = $L.pw; $ph = $L.ph; $colGap = $L.colGap; $text_w = $L.text_w
     $content_h = $L.content_h; $text_h = $L.text_h; $cardW = $L.cardW; $cardH = $L.cardH
+    $SM = $L.shadow
+
+    # The bitmap is bigger than the visible card by $SM on every side, so the drop shadow has room.
+    # The visible card sits at origin ($SM,$SM); all card content is drawn offset by that.
+    $ox = $SM; $oy = $SM
+    $bmpW = $cardW + 2 * $SM
+    $bmpH = $cardH + 2 * $SM
 
     # ---- compose ----
-    $card = New-Object System.Drawing.Bitmap($cardW, $cardH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $card = New-Object System.Drawing.Bitmap($bmpW, $bmpH, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($card)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
 
-    $g.SetClip((New-RoundedPath 0 0 $cardW $cardH $radius))
-    # opaque dark base (keeps interior alpha=255 so no premultiply needed)
-    $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 16, 16, 18))), 0, 0, $cardW, $cardH)
-    if ($backdrop) {
-        $dstA = $cardW / $cardH; $srcA = $backdrop.Width / $backdrop.Height
-        if ($srcA -gt $dstA) { $sh = $backdrop.Height; $sw = [int]($backdrop.Height * $dstA); $sx = [int](($backdrop.Width - $sw) / 2); $sy = 0 }
-        else { $sw = $backdrop.Width; $sh = [int]($backdrop.Width / $dstA); $sx = 0; $sy = [int](($backdrop.Height - $sh) / 2) }
-        $bdDest = New-Object System.Drawing.Rectangle(0, 0, $cardW, $cardH)
-        $g.DrawImage($backdrop, $bdDest, [single]$sx, [single]$sy, [single]$sw, [single]$sh, [System.Drawing.GraphicsUnit]::Pixel, $iaBd)
-    }
-    # dark scrim for text legibility (opaque result over opaque base/backdrop)
-    $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 0, 0, 0))), 0, 0, $cardW, $cardH)
+    $cardPath = New-RoundedPath $ox $oy $cardW $cardH $radius
 
-    # poster (rounded, with a faint border)
+    # ---- frosted card body ----
+    $g.SetClip($cardPath)
+    # opaque dark base (so the interior stays alpha=255 -> premultiplied == straight)
+    $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 14, 14, 17))), $ox, $oy, $cardW, $cardH)
+    if ($backdrop) {
+        Draw-BlurredBackdrop $g $backdrop $ox $oy $cardW $cardH $iaBd $doBlur
+        # frost tint: lets the blurred backdrop read faintly through a dark translucent panel
+        $g.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(165, 18, 18, 22))), $ox, $oy, $cardW, $cardH)
+    }
+    # inner top sheen (glass highlight)
+    $liteH = [Math]::Max(1, [int]($cardH * 0.28))
+    $liteRect = New-Object System.Drawing.Rectangle($ox, $oy, $cardW, $liteH)
+    $liteBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($liteRect, [System.Drawing.Color]::FromArgb(30, 255, 255, 255), [System.Drawing.Color]::FromArgb(0, 255, 255, 255), 90.0)
+    $g.FillRectangle($liteBrush, $liteRect)
+
+    # poster (soft shadow under it, then the image, then a faint rim)
     if ($poster -and $pw -gt 0) {
-        $px = $pad
-        $py = $pad + [int](($content_h - $ph) / 2)
+        $px = $ox + $pad
+        $py = $oy + $pad + [int](($content_h - $ph) / 2)
         $pPath = New-RoundedPath $px $py $pw $ph ([int]($radius * 0.6))
+        $pShadow = New-RoundedPath $px ($py + [int]($pad * 0.30)) $pw $ph ([int]($radius * 0.6))
+        Draw-SoftShadow $g $pShadow $bmpW $bmpH 120 ([Math]::Max(3, [int]($pad / 2)))
         $g.SetClip($pPath)
-        $pDest = New-Object System.Drawing.Rectangle($px, $py, $pw, $ph)
-        $g.DrawImage($poster, $pDest)   # true sRGB colors; HDR encode (if any) happens on the whole card
-        $g.SetClip((New-RoundedPath 0 0 $cardW $cardH $radius))  # restore card clip
+        $g.DrawImage($poster, (New-Object System.Drawing.Rectangle($px, $py, $pw, $ph)))   # true sRGB; HDR encode on whole card
+        $g.SetClip($cardPath)  # restore card clip
         $g.DrawPath((New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(110, 255, 255, 255), 1.5)), $pPath)
     }
 
     # text
-    $tx = $pad + $pw + $colGap
-    $ty = $pad + [int](($content_h - $text_h) / 2)
+    $tx = $ox + $pad + $pw + $colGap
+    $ty = $oy + $pad + [int](($content_h - $text_h) / 2)
     $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
     $grayB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 188, 188, 188))
     $plotB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 206, 206, 206))
@@ -280,17 +362,24 @@ try {
         $y += $L.hPlot
     }
     if ($credit) {
-        $g.DrawString($credit, $L.fCredit, $grayB, [single]$tx, [single]($y + $sp2))
+        $crect = New-Object System.Drawing.RectangleF([single]$tx, [single]($y + $sp2), [single]$text_w, [single]$L.creditH)
+        $g.DrawString([string]$credit, $L.fCredit, $grayB, $crect, $fmt)
     }
+
+    # hairline gradient border (top brighter -> bottom dimmer), drawn over the rounded card edge
+    $g.ResetClip()
+    $bordRect = New-Object System.Drawing.Rectangle($ox, $oy, $cardW, $cardH)
+    $bordBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($bordRect, [System.Drawing.Color]::FromArgb(120, 255, 255, 255), [System.Drawing.Color]::FromArgb(36, 255, 255, 255), 90.0)
+    $g.DrawPath((New-Object System.Drawing.Pen($bordBrush, 1.5)), $cardPath)
 
     $g.Dispose()
     if ($poster) { $poster.Dispose() }
     if ($backdrop) { $backdrop.Dispose() }
 
     # ---- export raw BGRA ----
-    $rect = New-Object System.Drawing.Rectangle(0, 0, $cardW, $cardH)
+    $rect = New-Object System.Drawing.Rectangle(0, 0, $bmpW, $bmpH)
     $data = $card.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $len = $data.Stride * $cardH
+    $len = $data.Stride * $bmpH
     $buf = New-Object byte[] $len
     [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $buf, 0, $len)
     $card.UnlockBits($data); $card.Dispose()
@@ -298,12 +387,16 @@ try {
     # ---- optional HDR encode: sRGB -> BT.2020 + PQ at RefNits (so mpv displays it correctly on HDR) ----
     if ($hdrEncode) { [TmdbHdr]::Encode($buf, $refNits) }
 
+    # ---- optional fade frames: pack full + N alpha-scaled copies into one file (selected by offset) ----
+    if ($fadeSteps -gt 0) { $buf = [TmdbHdr]::BuildPacked($buf, $fadeSteps) }
+
     $tmpOut = "$($s.out).tmp"
     [System.IO.File]::WriteAllBytes($tmpOut, $buf)
     if (Test-Path $s.out) { Remove-Item -LiteralPath $s.out -Force }
     Move-Item -LiteralPath $tmpOut -Destination $s.out -Force
 
-    Write-Output "$cardW $cardH"
+    # Print: <bitmapW> <bitmapH> <shadowMargin>  (Lua derives the visible card = bmp - 2*margin)
+    Write-Output "$bmpW $bmpH $SM"
     exit 0
 }
 catch {
